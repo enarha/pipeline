@@ -35,6 +35,7 @@ import (
 	labels "k8s.io/apimachinery/pkg/labels"
 	types "k8s.io/apimachinery/pkg/types"
 	sets "k8s.io/apimachinery/pkg/util/sets"
+	scheme "k8s.io/client-go/kubernetes/scheme"
 	record "k8s.io/client-go/tools/record"
 	controller "knative.dev/pkg/controller"
 	kmp "knative.dev/pkg/kmp"
@@ -101,6 +102,15 @@ type reconcilerImpl struct {
 	// finalizerName is the name of the finalizer to reconcile.
 	finalizerName string
 
+	// useServerSideApplyForFinalizers configures whether to use server-side apply for finalizer management
+	useServerSideApplyForFinalizers bool
+
+	// finalizerFieldManager is the field manager name for server-side apply of finalizers
+	finalizerFieldManager string
+
+	// forceApplyFinalizers configures whether to force server-side apply for finalizers
+	forceApplyFinalizers bool
+
 	// skipStatusUpdates configures whether or not this reconciler automatically updates
 	// the status of the reconciled resource.
 	skipStatusUpdates bool
@@ -160,6 +170,14 @@ func NewReconciler(ctx context.Context, logger *zap.SugaredLogger, client versio
 		}
 		if opts.DemoteFunc != nil {
 			rec.DemoteFunc = opts.DemoteFunc
+		}
+		if opts.UseServerSideApplyForFinalizers {
+			if opts.FinalizerFieldManager == "" {
+				logger.Fatal("FinalizerFieldManager must be provided when UseServerSideApplyForFinalizers is enabled")
+			}
+			rec.useServerSideApplyForFinalizers = true
+			rec.finalizerFieldManager = opts.FinalizerFieldManager
+			rec.forceApplyFinalizers = opts.ForceApplyFinalizers
 		}
 	}
 
@@ -347,6 +365,129 @@ func (r *reconcilerImpl) updateStatus(ctx context.Context, logger *zap.SugaredLo
 // TODO: this method could be generic and sync all finalizers. For now it only
 // updates defaultFinalizerName or its override.
 func (r *reconcilerImpl) updateFinalizersFiltered(ctx context.Context, resource *v1beta1.ResolutionRequest, desiredFinalizers sets.Set[string]) (*v1beta1.ResolutionRequest, error) {
+	if r.useServerSideApplyForFinalizers {
+		return r.updateFinalizersFilteredServerSideApply(ctx, resource, desiredFinalizers)
+	}
+	return r.updateFinalizersFilteredMergePatch(ctx, resource, desiredFinalizers)
+}
+
+// updateFinalizersFilteredServerSideApply uses server-side apply to manage only this controller's finalizer.
+//
+// IMPORTANT: Server-side apply behaves differently than merge patch when the target object
+// no longer exists (e.g. stale cache):
+// - Merge patch: Returns 404 NotFound (hard failure, no retry)
+// - Server-side apply: May attempt object creation, potentially causing:
+//   - Admission webhook rejections (soft failure, retry)
+//   - RBAC denials if CREATE permissions missing (soft failure, retry)
+//
+// Controller implementations should be aware of this behavioral difference and may want to:
+// - Handle creation-related errors as permanent failures
+// - Implement object existence checks before applying
+// - Ensure admission webhooks handle SSA creation attempts gracefully to prevent retries.
+func (r *reconcilerImpl) updateFinalizersFilteredServerSideApply(ctx context.Context, resource *v1beta1.ResolutionRequest, desiredFinalizers sets.Set[string]) (*v1beta1.ResolutionRequest, error) {
+	// Check if we need to do anything
+	existingFinalizers := sets.New[string](resource.Finalizers...)
+
+	if desiredFinalizers.Has(r.finalizerName) {
+		if existingFinalizers.Has(r.finalizerName) {
+			// Nothing to do.
+			return resource, nil
+		}
+		// Apply configuration with only our finalizer to add it
+		// Get the GVK from the client's scheme
+		gvks, _, err := scheme.Scheme.ObjectKinds(resource)
+		if err != nil || len(gvks) == 0 {
+			return resource, fmt.Errorf("failed to determine GVK for resource: %v", err)
+		}
+		gvk := gvks[0]
+
+		applyConfig := map[string]interface{}{
+			"apiVersion": gvk.GroupVersion().String(),
+			"kind":       gvk.Kind,
+			"metadata": map[string]interface{}{
+				"name":       resource.Name,
+				"uid":        resource.UID,
+				"finalizers": []string{r.finalizerName},
+			},
+		}
+
+		applyConfig["metadata"].(map[string]interface{})["namespace"] = resource.Namespace
+
+		patch, err := json.Marshal(applyConfig)
+		if err != nil {
+			return resource, err
+		}
+
+		patcher := r.Client.ResolutionV1beta1().ResolutionRequests(resource.Namespace)
+
+		patchOpts := metav1.PatchOptions{
+			FieldManager:    r.finalizerFieldManager,
+			Force:           &r.forceApplyFinalizers,
+			FieldValidation: metav1.FieldValidationStrict,
+		}
+
+		updated, err := patcher.Patch(ctx, resource.Name, types.ApplyPatchType, patch, patchOpts)
+		if err != nil {
+			r.Recorder.Eventf(resource, v1.EventTypeWarning, "FinalizerUpdateFailed",
+				"Failed to add finalizer for %q via server-side apply: %v", resource.Name, err)
+		} else {
+			r.Recorder.Eventf(updated, v1.EventTypeNormal, "FinalizerUpdate",
+				"Added finalizer for %q via server-side apply", resource.GetName())
+		}
+		return updated, err
+	} else {
+		if !existingFinalizers.Has(r.finalizerName) {
+			// Nothing to do.
+			return resource, nil
+		}
+		// For removal, we apply an empty configuration for our finalizer field manager
+		// This effectively removes our finalizer while preserving others
+		// Get the GVK from the client's scheme
+		gvks, _, err := scheme.Scheme.ObjectKinds(resource)
+		if err != nil || len(gvks) == 0 {
+			return resource, fmt.Errorf("failed to determine GVK for resource: %v", err)
+		}
+		gvk := gvks[0]
+
+		applyConfig := map[string]interface{}{
+			"apiVersion": gvk.GroupVersion().String(),
+			"kind":       gvk.Kind,
+			"metadata": map[string]interface{}{
+				"name":       resource.Name,
+				"uid":        resource.UID,
+				"finalizers": []string{}, // Empty array removes our managed finalizers
+			},
+		}
+
+		applyConfig["metadata"].(map[string]interface{})["namespace"] = resource.Namespace
+
+		patch, err := json.Marshal(applyConfig)
+		if err != nil {
+			return resource, err
+		}
+
+		patcher := r.Client.ResolutionV1beta1().ResolutionRequests(resource.Namespace)
+
+		patchOpts := metav1.PatchOptions{
+			FieldManager:    r.finalizerFieldManager,
+			Force:           &r.forceApplyFinalizers,
+			FieldValidation: metav1.FieldValidationStrict,
+		}
+
+		updated, err := patcher.Patch(ctx, resource.Name, types.ApplyPatchType, patch, patchOpts)
+		if err != nil {
+			r.Recorder.Eventf(resource, v1.EventTypeWarning, "FinalizerUpdateFailed",
+				"Failed to remove finalizer for %q via server-side apply: %v", resource.Name, err)
+		} else {
+			r.Recorder.Eventf(updated, v1.EventTypeNormal, "FinalizerUpdate",
+				"Removed finalizer for %q via server-side apply", resource.GetName())
+		}
+		return updated, err
+	}
+}
+
+// updateFinalizersFilteredMergePatch uses merge patch to manage finalizers (legacy behavior).
+func (r *reconcilerImpl) updateFinalizersFilteredMergePatch(ctx context.Context, resource *v1beta1.ResolutionRequest, desiredFinalizers sets.Set[string]) (*v1beta1.ResolutionRequest, error) {
 	// Don't modify the informers copy.
 	existing := resource.DeepCopy()
 

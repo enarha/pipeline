@@ -244,11 +244,6 @@ func main() {
 		webhookName = "webhook.pipeline.tekton.dev"
 	}
 
-	var statsReporterOptions []webhook.StatsReporterOption
-	enableNamespace := os.Getenv("WEBHOOK_METRICS_ENABLE_NAMESPACE")
-	if enableNamespace != "true" {
-		statsReporterOptions = append(statsReporterOptions, webhook.WithoutTags("resource_namespace"))
-	}
 
 	// Scope informers to the webhook's namespace instead of cluster-wide
 	ctx := injection.WithNamespaceScope(signals.NewContext(), system.Namespace())
@@ -259,7 +254,6 @@ func main() {
 		Port:        webhook.PortFromEnv(8443),
 		SecretName:  secretName,
 
-		StatsReporterOptions: statsReporterOptions,
 	})
 
 	mux := http.NewServeMux()
